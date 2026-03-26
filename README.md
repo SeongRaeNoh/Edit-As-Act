@@ -1,7 +1,7 @@
 # [CVPR 2026] Edit-As-Act: Goal-Regressive Planning for Open-Vocabulary 3D Indoor Scene Editing
 
 [![Website](https://img.shields.io/badge/Website-Visit-blue)](https://seongraenoh.github.io/edit-as-act/)  
-arXiv: coming soon
+[![arXiv](https://img.shields.io/badge/arXiv-2603.17583-b31b1b.svg)](https://arxiv.org/abs/2603.17583)
 
 ## Requirements
 
@@ -84,8 +84,18 @@ code/dataset/dataset/bedroom/plans_applied/scene_layout_instruction_1_add.json
 
 - [x] Dataset
 - [x] Model
-- [ ] Visualization code
+- [ ] Visualization code 
+The visualization code will be released by ~ 3/28
 
 ## BibTeX
 
-comming soon
+```bibtex
+@misc{noh2026editasactgoalregressiveplanningopenvocabulary,
+      title={Edit-As-Act: Goal-Regressive Planning for Open-Vocabulary 3D Indoor Scene Editing}, 
+      author={Seongrae Noh and SeungWon Seo and Gyeong-Moon Park and HyeongYeop Kang},
+      year={2026},
+      eprint={2603.17583},
+      archivePrefix={arXiv},
+      primaryClass={cs.CV},
+      url={https://arxiv.org/abs/2603.17583}, 
+}
