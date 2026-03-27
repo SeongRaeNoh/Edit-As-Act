@@ -112,7 +112,6 @@ If you want to export a Blender scene as a `scene_layout.json` file—for exampl
 - [x] Visualization code 
 
 
-The visualization code will be released by ~ 3/28
 
 ## BibTeX
 
