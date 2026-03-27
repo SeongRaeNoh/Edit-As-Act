@@ -7,7 +7,7 @@
 
 - Ubuntu 24.04
 - `uv`
-- Blender 4.0+
+- Blender 4.2
 
 ## Installation
 
@@ -22,9 +22,12 @@ uv sync
 
 ## Dataset
 
-Download the dataset from Google Drive:
 
-[Dataset Download](https://drive.google.com/file/d/1frv046LtXh1e2EtuY7rLg5zCdJl6Y75o/view?usp=sharing)
+
+Download the dataset from Google Drive:
+[Dataset Download](https://drive.google.com/file/d/1Pn41pI-txhvoqjLxLaLSJ9j2n93xNWtz/view?usp=sharing)
+
+Important: The dataset link was updated on March 27, 2026. If you downloaded the dataset before this update, please re-download it.
 
 After downloading, place the dataset under the `code/dataset/` directory so that the repository layout looks like this:
 
@@ -80,11 +83,33 @@ This produces per-instruction scene files such as:
 code/dataset/dataset/bedroom/plans_applied/scene_layout_instruction_1_add.json
 ```
 
+### 3. Visualize the edited scene in Blender
+
+To visualize a scene JSON produced in Step 2, use the Blender import script:
+
+1. Open `scene.blend`.
+2. Go to the **Scripting** workspace.
+3. Paste the contents of `tools/blender_scene_import.py` into the script editor.
+4. Set `JSON_PATH` to the path of the scene JSON you want to visualize.
+5. Click **Run Script**.
+
+This will load the specified scene layout into Blender for visualization.
+
+### Optional: Export a Blender scene to our dataset JSON format
+
+If you want to export a Blender scene as a `scene_layout.json` file—for example, to test your own scene—use the export script:
+
+1. Open `scene.blend`.
+2. Go to the **Scripting** workspace.
+3. Paste the contents of `tools/blender_scene_export.py` into the script editor.
+4. Set `EXPORT_DIR` to your desired output directory.
+5. Click **Run Script**.
+
 ## Todo
 
 - [x] Dataset
 - [x] Model
-- [ ] Visualization code 
+- [x] Visualization code 
 
 
 The visualization code will be released by ~ 3/28
