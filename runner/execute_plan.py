@@ -333,7 +333,7 @@ def extract_initial_state(scene: Dict[str, Any]) -> Set[Predicate]:
         for obj in scene["objects"]:
             oid = obj.get("id", obj.get("name"))
             if oid:
-                center = obj.get("center")
+                center = obj.get("center", obj.get("location"))
                 dims = obj.get("dims", obj.get("dim"))
                 objects_data[oid] = {"center": center, "dims": dims}
     else:
