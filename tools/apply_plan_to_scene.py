@@ -1,380 +1,570 @@
 #!/usr/bin/env python3
-"""
-Apply EditLang plans to a scene layout JSON and save per-instruction results.
 
-Reads:
-  - Original scene_layout_edited.json (mask-key format)
-  - benchmark_bedroom_results.json  (plan with semantic IDs)
-
-Outputs:
-  - scene_layout_instruction_{index}_{command}.json  (same format as original)
-
-Usage:
-  python3 tools/apply_plan_to_scene.py \
-    --scene  dataset/dataset/bedroom/scene_layout_edited.json \
-    --plans  tests/benchmark_bedroom_results.json \
-    --outdir dataset/dataset/bedroom/plans_applied
-"""
-
-import json, copy, math, os, argparse
-from typing import Dict, Any, Optional, List, Tuple
+import json
+import copy
+import math
+import os
+import argparse
+from typing import Dict, List, Any, Optional, Tuple
 
 
-# ─────────────────────────────────────────────────────────────
-#  ID Mapping:  scene_mask_009_armchairs.png  ↔  armchairs_009
-# ─────────────────────────────────────────────────────────────
-def build_id_maps(scene: Dict[str, Any]):
-    """Build bidirectional maps: mask_key ↔ semantic_id."""
-    mask_to_sem = {}
-    sem_to_mask = {}
-    for key in scene:
-        if key.startswith("scene_mask_") and key.endswith(".png"):
-            if key == "scene_mask_RoomContainer.png":
-                mask_to_sem[key] = "RoomContainer"
-                sem_to_mask["RoomContainer"] = key
-                continue
-            parts = key.replace("scene_mask_", "").replace(".png", "").split("_")
-            if len(parts) >= 2:
-                obj_num = parts[0]
-                category = "_".join(parts[1:])
-                sem_id = f"{category}_{obj_num}"
-                mask_to_sem[key] = sem_id
-                sem_to_mask[sem_id] = key
-    return mask_to_sem, sem_to_mask
+# ─────────────────────────────────────────────────────────────────────────────
+#  ID / object lookup helpers
+# ─────────────────────────────────────────────────────────────────────────────
+
+def build_id_maps(scene: Dict[str, Any]) -> Tuple[Dict[str, str], Dict[str, str]]:
+    """Build bidirectional maps between EMPTY names and semantic IDs.
+
+    EMPTY name  "{index}_{category}"  <->  semantic ID  "{category}_{index}"
+    e.g.        "000_wall_tvs"        <->  "wall_tvs_000"
+
+    Returns:
+        name_to_sem: EMPTY name  -> semantic ID
+        sem_to_name: semantic ID -> EMPTY name
+    """
+    name_to_sem: Dict[str, str] = {}
+    sem_to_name: Dict[str, str] = {}
+
+    for obj in scene["objects"]:
+        if obj["type"] != "EMPTY":
+            continue
+        name = obj["name"]
+        if name == "RoomContainer":
+            name_to_sem[name] = "RoomContainer"
+            sem_to_name["RoomContainer"] = name
+            continue
+        parts = name.split("_")
+        if len(parts) >= 2 and parts[0].isdigit():
+            idx = parts[0]
+            category = "_".join(parts[1:])
+            sem_id = f"{category}_{idx}"
+            name_to_sem[name] = sem_id
+            sem_to_name[sem_id] = name
+
+    return name_to_sem, sem_to_name
 
 
-def sem_to_mask_key(sem_id: str, sem_to_mask: Dict[str, str]) -> Optional[str]:
-    """Look up the mask key for a semantic ID."""
-    return sem_to_mask.get(sem_id)
+def _find_empty(scene: Dict[str, Any], name: str) -> Optional[Dict]:
+    """Return the EMPTY object dict with the given name, or None."""
+    for obj in scene["objects"]:
+        if obj["type"] == "EMPTY" and obj["name"] == name:
+            return obj
+    return None
 
 
-def next_mask_index(scene: Dict[str, Any]) -> int:
-    """Find the next available mask index number."""
+def _find_mesh_child(scene: Dict[str, Any], parent_name: str) -> Optional[Dict]:
+    """Return the first MESH whose parent matches parent_name, or None."""
+    for obj in scene["objects"]:
+        if obj["type"] == "MESH" and obj.get("parent") == parent_name:
+            return obj
+    return None
+
+
+def _resolve(sem_id: str, sem_to_name: Dict[str, str]) -> Optional[str]:
+    """Resolve semantic ID to EMPTY name, or None."""
+    return sem_to_name.get(sem_id)
+
+
+def _next_name_index(scene: Dict[str, Any]) -> int:
+    """Return the next available numeric index for a new EMPTY name."""
     max_idx = -1
-    for key in scene:
-        if key.startswith("scene_mask_") and key.endswith(".png"):
-            parts = key.replace("scene_mask_", "").replace(".png", "").split("_")
+    for obj in scene["objects"]:
+        if obj["type"] == "EMPTY":
+            parts = obj["name"].split("_")
             if parts and parts[0].isdigit():
                 max_idx = max(max_idx, int(parts[0]))
     return max_idx + 1
 
 
-# ─────────────────────────────────────────────────────────────
-#  Action Applicators
-# ─────────────────────────────────────────────────────────────
-def apply_action(scene: Dict, action: Dict, sem_to_mask: Dict, mask_to_sem: Dict) -> str:
-    """Apply a single action to scene (mutates in place). Returns a log message."""
-    name = action["action"]
-    args = action.get("args", {})
+# ─────────────────────────────────────────────────────────────────────────────
+#  matrix_world / quaternion recomputation
+# ─────────────────────────────────────────────────────────────────────────────
 
-    if name == "remove_object":
-        return _apply_remove(scene, args, sem_to_mask, mask_to_sem)
-    elif name == "add_object":
-        return _apply_add(scene, args, sem_to_mask, mask_to_sem)
-    elif name == "move_to":
-        return _apply_move_to(scene, args, sem_to_mask)
-    elif name == "place_relative":
-        return _apply_place_relative(scene, args, sem_to_mask)
-    elif name == "place_on":
-        return _apply_place_on(scene, args, sem_to_mask)
-    elif name == "place_between":
-        return _apply_place_between(scene, args, sem_to_mask)
-    elif name == "rotate_towards":
-        return _apply_rotate_towards(scene, args, sem_to_mask)
-    elif name == "rotate_by":
-        return _apply_rotate_by(scene, args, sem_to_mask)
-    elif name == "scale":
-        return _apply_scale(scene, args, sem_to_mask)
-    elif name == "align_with":
-        return _apply_align_with(scene, args, sem_to_mask)
-    elif name == "stylize":
-        return _apply_stylize(scene, args, sem_to_mask)
-    elif name == "move_group":
-        return _apply_move_to(scene, args, sem_to_mask)  # same as move_to for layout
-    else:
-        return f"  [SKIP] Unknown action: {name}"
+def _sync_quaternion(obj: Dict) -> None:
+    """Keep rotation_quaternion consistent with rotation_euler[2] (yaw around Z).
+
+    Uses the half-angle formula for a pure Z-axis rotation:
+        q = [cos(θ/2), 0, 0, sin(θ/2)]  →  [w, x, y, z]
+    Only applied when rotation_mode == "XYZ".
+    """
+    if obj.get("rotation_mode") != "XYZ":
+        return
+    yaw = obj["rotation_euler"][2]
+    half = yaw / 2.0
+    obj["rotation_quaternion"] = [math.cos(half), 0.0, 0.0, math.sin(half)]
 
 
-def _resolve(sem_id: str, sem_to_mask: Dict) -> Optional[str]:
-    """Resolve semantic ID to mask key, or None."""
-    return sem_to_mask.get(sem_id)
+def _recompute_matrix_world(obj: Dict) -> None:
+    """Recompute matrix_world from location, rotation_euler[2], and scale.
+
+    The matrix encodes a rotation around the Z-axis (yaw) followed by
+    a non-uniform scale, with translation appended:
+
+        | cos(yaw)*sx  -sin(yaw)*sy  0   tx |
+        | sin(yaw)*sx   cos(yaw)*sy  0   ty |
+        |     0              0       sz  tz |
+        |     0              0       0   1  |
+    """
+    tx, ty, tz = obj["location"]
+    yaw = obj["rotation_euler"][2]
+    sx, sy, sz = obj["scale"]
+
+    cos_y = math.cos(yaw)
+    sin_y = math.sin(yaw)
+
+    obj["matrix_world"] = [
+        [cos_y * sx, -sin_y * sy, 0.0, tx],
+        [sin_y * sx,  cos_y * sy, 0.0, ty],
+        [0.0,         0.0,        sz,  tz],
+        [0.0,         0.0,        0.0, 1.0],
+    ]
+    _sync_quaternion(obj)
 
 
-def _apply_remove(scene, args, sem_to_mask, mask_to_sem):
-    obj = args.get("obj", "")
-    mask_key = _resolve(obj, sem_to_mask)
-    if mask_key and mask_key in scene:
-        del scene[mask_key]
-        del sem_to_mask[obj]
-        if mask_key in mask_to_sem:
-            del mask_to_sem[mask_key]
-        return f"  remove_object({obj}) → deleted {mask_key}"
-    return f"  remove_object({obj}) → NOT FOUND (skipped)"
+def _sync_mesh_child(scene: Dict, empty_name: str) -> None:
+    """Copy the EMPTY's matrix_world to its MESH child (child has identity local transform)."""
+    empty = _find_empty(scene, empty_name)
+    if empty is None:
+        return
+    mesh = _find_mesh_child(scene, empty_name)
+    if mesh is not None:
+        mesh["matrix_world"] = [row[:] for row in empty["matrix_world"]]
 
 
-def _apply_add(scene, args, sem_to_mask, mask_to_sem):
-    obj = args.get("obj", "")
-    cat = args.get("cat", "object")
-    support = args.get("support", "")
+def _update_bbox(obj: Dict) -> None:
+    """Recompute bbox from location and dim (if dim is present).
 
-    if obj in sem_to_mask:
-        return f"  add_object({obj}) → already exists (skipped)"
+    After a translation, the AABB center moves but the size (dim) stays the same.
+    After a scale, dim is already updated by the caller before this is invoked.
+    Rotation changes the AABB shape non-trivially; for a pure yaw rotation around Y
+    we recompute the axis-aligned half-extents from the rotated box corners.
 
-    # Find support position
-    support_key = _resolve(support, sem_to_mask)
-    if support_key and support_key in scene:
-        sup = scene[support_key]
-        sup_center = sup.get("center", [0, 0, 0])
-        sup_dim = sup.get("dim", [0.1, 0.1, 0.1])
-        # Place on top of support
-        new_center = [sup_center[0], sup_center[1] + sup_dim[1]/2 + 0.05, sup_center[2]]
-    else:
-        # Default placement at room center
-        new_center = [0.0, 0.3, 0.0]
+    bbox layout: [min_x, max_x, min_y, max_y, min_z, max_z]
+    """
+    if "dim" not in obj:
+        return
 
-    # Generate mask key
-    idx = next_mask_index(scene)
-    # Clean category name for mask key
-    cat_clean = cat.replace(" ", "_").lower()
-    mask_key = f"scene_mask_{idx:03d}_{cat_clean}.png"
+    cx, cy, cz = obj["location"]
+    dx, dy, dz = obj["dim"]
+    yaw = obj["rotation_euler"][2]
 
-    # Default dimensions for new object
-    default_dim = [0.05, 0.05, 0.05]
+    # Rotated AABB half-extents in X and Z (Y / height axis is unaffected by yaw)
+    half_dx = dx / 2.0
+    half_dz = dz / 2.0
+    cos_a = abs(math.cos(yaw))
+    sin_a = abs(math.sin(yaw))
+    hx = half_dx * cos_a + half_dz * sin_a   # AABB half-width after yaw
+    hz = half_dx * sin_a + half_dz * cos_a   # AABB half-depth after yaw
+    hy = dy / 2.0                              # height unaffected by yaw
 
-    scene[mask_key] = {
-        "dim": default_dim,
-        "center": new_center,
-        "bbox": [
-            new_center[0] - default_dim[0]/2,
-            new_center[0] + default_dim[0]/2,
-            new_center[1] - default_dim[1]/2,
-            new_center[1] + default_dim[1]/2,
-            new_center[2] - default_dim[2]/2,
-            new_center[2] + default_dim[2]/2,
-        ],
-        "pose": 0.0,
-        "front_face": "MIN_Y",
-        "on_floor": False,
-        "on_wall": None,
-        "_added_by_plan": True,
-        "_semantic_id": obj,
-        "_category": cat,
-    }
-    sem_to_mask[obj] = mask_key
-    mask_to_sem[mask_key] = obj
-    return f"  add_object({obj}, cat={cat}, support={support}) → {mask_key}"
-
-
-def _apply_move_to(scene, args, sem_to_mask):
-    obj = args.get("obj", args.get("parent", ""))
-    pos = args.get("pos", "")
-    mask_key = _resolve(obj, sem_to_mask)
-    if not mask_key or mask_key not in scene:
-        return f"  move_to({obj}) → NOT FOUND"
-
-    # Parse position (could be "x,y,z" or a single string)
-    try:
-        if isinstance(pos, (list, tuple)):
-            coords = [float(p) for p in pos]
-        elif "," in str(pos):
-            coords = [float(p) for p in str(pos).split(",")]
-        else:
-            # Single value — can't determine 3D position, skip
-            return f"  move_to({obj}, pos={pos}) → ambiguous position (skipped)"
-        scene[mask_key]["center"] = coords[:3]
-        _recompute_bbox(scene[mask_key])
-        return f"  move_to({obj}) → center={coords[:3]}"
-    except (ValueError, IndexError):
-        return f"  move_to({obj}, pos={pos}) → parse error (skipped)"
-
-
-def _apply_place_relative(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    target = args.get("target", "")
-    relation = args.get("relation", "near")
-
-    obj_key = _resolve(obj, sem_to_mask)
-    tgt_key = _resolve(target, sem_to_mask)
-
-    if not obj_key or obj_key not in scene:
-        return f"  place_relative({obj}) → obj NOT FOUND"
-    if not tgt_key or tgt_key not in scene:
-        return f"  place_relative({obj}, target={target}) → target NOT FOUND"
-
-    t_center = scene[tgt_key]["center"]
-    t_dim = scene[tgt_key].get("dim", [0.1, 0.1, 0.1])
-    o_dim = scene[obj_key].get("dim", [0.1, 0.1, 0.1])
-    offset = 0.15
-
-    new_center = list(t_center)
-    if relation == "left_of":
-        new_center[0] = t_center[0] - t_dim[0]/2 - o_dim[0]/2 - offset
-    elif relation == "right_of":
-        new_center[0] = t_center[0] + t_dim[0]/2 + o_dim[0]/2 + offset
-    elif relation == "in_front_of":
-        new_center[2] = t_center[2] - t_dim[2]/2 - o_dim[2]/2 - offset
-    elif relation == "behind":
-        new_center[2] = t_center[2] + t_dim[2]/2 + o_dim[2]/2 + offset
-    else:  # "near" or default
-        new_center[0] = t_center[0] + t_dim[0]/2 + o_dim[0]/2 + offset
-
-    scene[obj_key]["center"] = new_center
-    _recompute_bbox(scene[obj_key])
-    return f"  place_relative({obj}, {target}, {relation}) → center={[round(c,3) for c in new_center]}"
-
-
-def _apply_place_on(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    surface = args.get("surface", "")
-    obj_key = _resolve(obj, sem_to_mask)
-    srf_key = _resolve(surface, sem_to_mask)
-
-    if not obj_key or obj_key not in scene:
-        return f"  place_on({obj}) → NOT FOUND"
-    if not srf_key or srf_key not in scene:
-        return f"  place_on({obj}, surface={surface}) → surface NOT FOUND"
-
-    s = scene[srf_key]
-    o = scene[obj_key]
-    new_center = [s["center"][0], s["center"][1] + s["dim"][1]/2 + o["dim"][1]/2, s["center"][2]]
-    o["center"] = new_center
-    _recompute_bbox(o)
-    return f"  place_on({obj}, {surface}) → center={[round(c,3) for c in new_center]}"
-
-
-def _apply_place_between(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    obj1 = args.get("obj1", "")
-    obj2 = args.get("obj2", "")
-    ok = _resolve(obj, sem_to_mask)
-    k1 = _resolve(obj1, sem_to_mask)
-    k2 = _resolve(obj2, sem_to_mask)
-
-    if not ok or ok not in scene:
-        return f"  place_between({obj}) → NOT FOUND"
-    if not k1 or k1 not in scene or not k2 or k2 not in scene:
-        return f"  place_between({obj}) → reference objects NOT FOUND"
-
-    c1 = scene[k1]["center"]
-    c2 = scene[k2]["center"]
-    midpoint = [(c1[i] + c2[i]) / 2 for i in range(3)]
-    scene[ok]["center"] = midpoint
-    _recompute_bbox(scene[ok])
-    return f"  place_between({obj}, {obj1}, {obj2}) → center={[round(c,3) for c in midpoint]}"
-
-
-def _apply_rotate_towards(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    target = args.get("target", "")
-    ok = _resolve(obj, sem_to_mask)
-    tk = _resolve(target, sem_to_mask)
-
-    if not ok or ok not in scene:
-        return f"  rotate_towards({obj}) → NOT FOUND"
-    if not tk or tk not in scene:
-        return f"  rotate_towards({obj}, target={target}) → target NOT FOUND"
-
-    oc = scene[ok]["center"]
-    tc = scene[tk]["center"]
-    angle = math.atan2(tc[2] - oc[2], tc[0] - oc[0])
-    scene[ok]["pose"] = angle
-    return f"  rotate_towards({obj}, {target}) → pose={round(angle, 4)} rad"
-
-
-def _apply_rotate_by(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    degrees = float(args.get("degrees", 0))
-    ok = _resolve(obj, sem_to_mask)
-    if not ok or ok not in scene:
-        return f"  rotate_by({obj}) → NOT FOUND"
-    scene[ok]["pose"] = scene[ok].get("pose", 0) + math.radians(degrees)
-    return f"  rotate_by({obj}, {degrees}°) → pose={round(scene[ok]['pose'], 4)} rad"
-
-
-def _apply_scale(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    sx = float(args.get("sx", 1))
-    sy = float(args.get("sy", 1))
-    sz = float(args.get("sz", 1))
-    ok = _resolve(obj, sem_to_mask)
-    if not ok or ok not in scene:
-        return f"  scale({obj}) → NOT FOUND"
-
-    dim = scene[ok].get("dim", [0.1, 0.1, 0.1])
-    scene[ok]["dim"] = [dim[0] * sx, dim[1] * sy, dim[2] * sz]
-    _recompute_bbox(scene[ok])
-    return f"  scale({obj}, [{sx},{sy},{sz}]) → dim={[round(d,4) for d in scene[ok]['dim']]}"
-
-
-def _apply_align_with(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    target = args.get("target", "")
-    axis = args.get("axis", "x")
-    ok = _resolve(obj, sem_to_mask)
-    tk = _resolve(target, sem_to_mask)
-
-    if not ok or ok not in scene or not tk or tk not in scene:
-        return f"  align_with({obj}, {target}) → NOT FOUND"
-
-    axis_map = {"x": 0, "y": 1, "z": 2}
-    ai = axis_map.get(axis.lower(), 0)
-    scene[ok]["center"][ai] = scene[tk]["center"][ai]
-    _recompute_bbox(scene[ok])
-    return f"  align_with({obj}, {target}, axis={axis})"
-
-
-def _apply_stylize(scene, args, sem_to_mask):
-    obj = args.get("obj", "")
-    desc = args.get("desc", "")
-    ok = _resolve(obj, sem_to_mask)
-    if not ok or ok not in scene:
-        return f"  stylize({obj}) → NOT FOUND"
-
-    scene[ok]["_style"] = desc
-    return f"  stylize({obj}, '{desc}')"
-
-
-def _recompute_bbox(obj_data: Dict):
-    """Recompute bbox from center and dim."""
-    c = obj_data["center"]
-    d = obj_data["dim"]
-    obj_data["bbox"] = [
-        c[0] - d[0]/2, c[0] + d[0]/2,
-        c[1] - d[1]/2, c[1] + d[1]/2,
-        c[2] - d[2]/2, c[2] + d[2]/2,
+    obj["bbox"] = [
+        round(cx - hx, 6), round(cx + hx, 6),
+        round(cy - hy, 6), round(cy + hy, 6),
+        round(cz - hz, 6), round(cz + hz, 6),
     ]
 
 
-# ─────────────────────────────────────────────────────────────
-#  Main
-# ─────────────────────────────────────────────────────────────
-def main():
-    parser = argparse.ArgumentParser(description="Apply EditLang plans to scene layout")
-    parser.add_argument("--scene", required=True, help="Path to scene_layout_edited.json")
-    parser.add_argument("--plans", required=True, help="Path to benchmark_bedroom_results.json")
-    parser.add_argument("--outdir", required=True, help="Output directory for per-instruction scenes")
-    args = parser.parse_args()
+# ─────────────────────────────────────────────────────────────────────────────
+#  Action applicators
+# ─────────────────────────────────────────────────────────────────────────────
 
-    # Load originals
-    with open(args.scene) as f:
+def apply_action(
+    scene: Dict,
+    action: Dict,
+    sem_to_name: Dict[str, str],
+    name_to_sem: Dict[str, str],
+) -> str:
+    """Apply a single action to the scene (mutates in place). Returns a log line."""
+    name = action["action"]
+    args = action.get("args", {})
+
+    dispatch = {
+        "remove_object":   _apply_remove,
+        "add_object":      _apply_add,
+        "move_to":         _apply_move_to,
+        "move_group":      _apply_move_to,   # same geometry as move_to
+        "place_relative":  _apply_place_relative,
+        "place_on":        _apply_place_on,
+        "place_between":   _apply_place_between,
+        "rotate_towards":  _apply_rotate_towards,
+        "rotate_by":       _apply_rotate_by,
+        "scale":           _apply_scale,
+        "align_with":      _apply_align_with,
+        "stylize":         _apply_stylize,
+    }
+
+    fn = dispatch.get(name)
+    if fn is None:
+        return f"  [SKIP] Unknown action: {name}"
+    return fn(scene, args, sem_to_name, name_to_sem)
+
+
+# ── remove_object ─────────────────────────────────────────────────────────────
+
+def _apply_remove(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", "")
+    empty_name = _resolve(obj_id, sem_to_name)
+    if empty_name is None:
+        return f"  remove_object({obj_id}) → NOT FOUND (skipped)"
+
+    removed = []
+    keep = []
+    for o in scene["objects"]:
+        if o["name"] == empty_name and o["type"] == "EMPTY":
+            removed.append(o["name"])
+        elif o["type"] == "MESH" and o.get("parent") == empty_name:
+            removed.append(o["name"])
+        else:
+            keep.append(o)
+    scene["objects"] = keep
+
+    # Clean up maps
+    del sem_to_name[obj_id]
+    if empty_name in name_to_sem:
+        del name_to_sem[empty_name]
+
+    return f"  remove_object({obj_id}) → removed {removed}"
+
+
+# ── add_object ────────────────────────────────────────────────────────────────
+
+def _apply_add(scene, args, sem_to_name, name_to_sem):
+    obj_id  = args.get("obj", "")
+    cat     = args.get("cat", "object")
+    support = args.get("support", "")
+
+    if obj_id in sem_to_name:
+        return f"  add_object({obj_id}) → already exists (skipped)"
+
+    # Determine placement position
+    support_name = _resolve(support, sem_to_name)
+    support_obj  = _find_empty(scene, support_name) if support_name else None
+
+    if support_obj is not None:
+        sloc   = support_obj["location"]
+        s_sy   = support_obj["scale"][1]
+        new_loc = [sloc[0], sloc[1] + s_sy + 0.05, sloc[2]]
+    else:
+        new_loc = [0.0, 0.05, 0.0]   # room centre, near floor
+
+    # Build a new unique name
+    idx        = _next_name_index(scene)
+    cat_clean  = cat.replace(" ", "_").lower()
+    empty_name = f"{idx:03d}_{cat_clean}"
+
+    new_scale  = [0.05, 0.05, 0.05]
+    new_euler  = [0.0, 0.0, 0.0]
+
+    new_empty: Dict[str, Any] = {
+        "name":               empty_name,
+        "type":               "EMPTY",
+        "location":           new_loc,
+        "rotation_mode":      "XYZ",
+        "rotation_euler":     new_euler,
+        "rotation_quaternion":[1.0, 0.0, 0.0, 0.0],
+        "scale":              new_scale,
+        "matrix_world":       [[1,0,0,0],[0,1,0,0],[0,0,1,0],[0,0,0,1]],
+        "parent":             None,
+        "parent_type":        "OBJECT",
+        "collections":        ["Collection"],
+        "hide_viewport":      False,
+        "hide_render":        False,
+        "_added_by_plan":     True,
+        "_semantic_id":       obj_id,
+        "_category":          cat,
+    }
+    _recompute_matrix_world(new_empty)
+
+    # Minimal MESH child (no real geometry, placeholder)
+    mesh_name = f"model.{idx:03d}"
+    new_mesh: Dict[str, Any] = {
+        "name":               mesh_name,
+        "type":               "MESH",
+        "location":           [0.0, 0.0, 0.0],
+        "rotation_mode":      "QUATERNION",
+        "rotation_euler":     [0.0, 0.0, 0.0],
+        "rotation_quaternion":[1.0, 0.0, 0.0, 0.0],
+        "scale":              [1.0, 1.0, 1.0],
+        "matrix_world":       [row[:] for row in new_empty["matrix_world"]],
+        "parent":             empty_name,
+        "parent_type":        "OBJECT",
+        "collections":        ["Scene Collection"],
+        "hide_viewport":      False,
+        "hide_render":        False,
+        "glb_file":           f"{mesh_name}.glb",
+    }
+
+    scene["objects"].extend([new_empty, new_mesh])
+    sem_to_name[obj_id]    = empty_name
+    name_to_sem[empty_name] = obj_id
+
+    return f"  add_object({obj_id}, cat={cat}, support={support}) → {empty_name}"
+
+
+# ── move_to ───────────────────────────────────────────────────────────────────
+
+def _apply_move_to(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", args.get("parent", ""))
+    pos    = args.get("pos", "")
+    name   = _resolve(obj_id, sem_to_name)
+    empty  = _find_empty(scene, name) if name else None
+    if empty is None:
+        return f"  move_to({obj_id}) → NOT FOUND"
+
+    try:
+        if isinstance(pos, (list, tuple)):
+            coords = [float(v) for v in pos]
+        elif "," in str(pos):
+            coords = [float(v) for v in str(pos).split(",")]
+        else:
+            return f"  move_to({obj_id}, pos={pos}) → ambiguous position (skipped)"
+
+        empty["location"] = coords[:3]
+        _recompute_matrix_world(empty)
+        _sync_mesh_child(scene, name)
+        return f"  move_to({obj_id}) → location={[round(c, 4) for c in coords[:3]]}"
+    except (ValueError, IndexError):
+        return f"  move_to({obj_id}, pos={pos}) → parse error (skipped)"
+
+
+# ── place_relative ────────────────────────────────────────────────────────────
+
+def _apply_place_relative(scene, args, sem_to_name, name_to_sem):
+    obj_id   = args.get("obj", "")
+    tgt_id   = args.get("target", "")
+    relation = args.get("relation", "near")
+
+    obj_name = _resolve(obj_id, sem_to_name)
+    tgt_name = _resolve(tgt_id, sem_to_name)
+    obj_e    = _find_empty(scene, obj_name) if obj_name else None
+    tgt_e    = _find_empty(scene, tgt_name) if tgt_name else None
+
+    if obj_e is None:
+        return f"  place_relative({obj_id}) → obj NOT FOUND"
+    if tgt_e is None:
+        return f"  place_relative({obj_id}, target={tgt_id}) → target NOT FOUND"
+
+    tc = tgt_e["location"]     # [tx, ty, tz]
+    ts = tgt_e["scale"]        # approx half-extents
+    os_ = obj_e["scale"]
+
+    GAP = 0.05
+    new_loc = list(tc)
+
+    # Coordinate axes: X=left/right, Y=up/height, Z=front/back (Z increases away)
+    if relation == "left_of":
+        new_loc[0] = tc[0] - ts[0] - os_[0] - GAP
+    elif relation == "right_of":
+        new_loc[0] = tc[0] + ts[0] + os_[0] + GAP
+    elif relation == "in_front_of":
+        new_loc[2] = tc[2] + ts[2] + os_[2] + GAP
+    elif relation == "behind":
+        new_loc[2] = tc[2] - ts[2] - os_[2] - GAP
+    else:  # "near" or default
+        new_loc[0] = tc[0] + ts[0] + os_[0] + GAP
+
+    obj_e["location"] = new_loc
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, obj_name)
+    return (f"  place_relative({obj_id}, {tgt_id}, {relation}) "
+            f"→ location={[round(c, 4) for c in new_loc]}")
+
+
+# ── place_on ──────────────────────────────────────────────────────────────────
+
+def _apply_place_on(scene, args, sem_to_name, name_to_sem):
+    obj_id  = args.get("obj", "")
+    srf_id  = args.get("surface", "")
+
+    obj_name = _resolve(obj_id, sem_to_name)
+    srf_name = _resolve(srf_id, sem_to_name)
+    obj_e    = _find_empty(scene, obj_name) if obj_name else None
+    srf_e    = _find_empty(scene, srf_name) if srf_name else None
+
+    if obj_e is None:
+        return f"  place_on({obj_id}) → NOT FOUND"
+    if srf_e is None:
+        return f"  place_on({obj_id}, surface={srf_id}) → surface NOT FOUND"
+
+    # Top of surface (Y-up): surface_center_y + surface_half_height + object_half_height
+    srf_top   = srf_e["location"][1] + srf_e["scale"][1]
+    new_loc   = [srf_e["location"][0],
+                 srf_top + obj_e["scale"][1],
+                 srf_e["location"][2]]
+
+    obj_e["location"] = new_loc
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, obj_name)
+    return f"  place_on({obj_id}, {srf_id}) → location={[round(c, 4) for c in new_loc]}"
+
+
+# ── place_between ─────────────────────────────────────────────────────────────
+
+def _apply_place_between(scene, args, sem_to_name, name_to_sem):
+    obj_id  = args.get("obj", "")
+    ref1_id = args.get("obj1", "")
+    ref2_id = args.get("obj2", "")
+
+    ok  = _resolve(obj_id,  sem_to_name)
+    k1  = _resolve(ref1_id, sem_to_name)
+    k2  = _resolve(ref2_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    e1    = _find_empty(scene, k1) if k1 else None
+    e2    = _find_empty(scene, k2) if k2 else None
+
+    if obj_e is None:
+        return f"  place_between({obj_id}) → NOT FOUND"
+    if e1 is None or e2 is None:
+        return f"  place_between({obj_id}) → reference objects NOT FOUND"
+
+    midpoint = [(e1["location"][i] + e2["location"][i]) / 2 for i in range(3)]
+    obj_e["location"] = midpoint
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, ok)
+    return (f"  place_between({obj_id}, {ref1_id}, {ref2_id}) "
+            f"→ location={[round(c, 4) for c in midpoint]}")
+
+
+# ── rotate_towards ────────────────────────────────────────────────────────────
+
+def _apply_rotate_towards(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", "")
+    tgt_id = args.get("target", "")
+
+    ok  = _resolve(obj_id, sem_to_name)
+    tk  = _resolve(tgt_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    tgt_e = _find_empty(scene, tk) if tk else None
+
+    if obj_e is None:
+        return f"  rotate_towards({obj_id}) → NOT FOUND"
+    if tgt_e is None:
+        return f"  rotate_towards({obj_id}, target={tgt_id}) → target NOT FOUND"
+
+    # Yaw = angle in the XZ-plane (horizontal plane; Y is up).
+    # Convention from scene data: yaw=0 → faces +Z, yaw=π/2 → faces +X,
+    # so forward(θ) = (sin(θ), 0, cos(θ)) and θ = atan2(dx, dz).
+    dx = tgt_e["location"][0] - obj_e["location"][0]
+    dz = tgt_e["location"][2] - obj_e["location"][2]
+    yaw = math.atan2(dx, dz)
+
+    obj_e["rotation_euler"][2] = yaw
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, ok)
+    return f"  rotate_towards({obj_id}, {tgt_id}) → yaw={round(yaw, 4)} rad"
+
+
+# ── rotate_by ─────────────────────────────────────────────────────────────────
+
+def _apply_rotate_by(scene, args, sem_to_name, name_to_sem):
+    obj_id  = args.get("obj", "")
+    degrees = float(args.get("degrees", 0))
+
+    ok    = _resolve(obj_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    if obj_e is None:
+        return f"  rotate_by({obj_id}) → NOT FOUND"
+
+    obj_e["rotation_euler"][2] += math.radians(degrees)
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, ok)
+    return (f"  rotate_by({obj_id}, {degrees}°) "
+            f"→ yaw={round(obj_e['rotation_euler'][2], 4)} rad")
+
+
+# ── scale ─────────────────────────────────────────────────────────────────────
+
+def _apply_scale(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", "")
+    sx = float(args.get("sx", 1))
+    sy = float(args.get("sy", 1))
+    sz = float(args.get("sz", 1))
+
+    ok    = _resolve(obj_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    if obj_e is None:
+        return f"  scale({obj_id}) → NOT FOUND"
+
+    obj_e["scale"] = [obj_e["scale"][0] * sx,
+                      obj_e["scale"][1] * sy,
+                      obj_e["scale"][2] * sz]
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, ok)
+    return (f"  scale({obj_id}, [{sx},{sy},{sz}]) "
+            f"→ scale={[round(s, 5) for s in obj_e['scale']]}")
+
+
+# ── align_with ────────────────────────────────────────────────────────────────
+
+def _apply_align_with(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", "")
+    tgt_id = args.get("target", "")
+    axis   = args.get("axis", "x").lower()
+
+    ok  = _resolve(obj_id, sem_to_name)
+    tk  = _resolve(tgt_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    tgt_e = _find_empty(scene, tk) if tk else None
+
+    if obj_e is None or tgt_e is None:
+        return f"  align_with({obj_id}, {tgt_id}) → NOT FOUND"
+
+    axis_map = {"x": 0, "y": 1, "z": 2}
+    ai = axis_map.get(axis, 0)
+    obj_e["location"][ai] = tgt_e["location"][ai]
+    _recompute_matrix_world(obj_e)
+    _sync_mesh_child(scene, ok)
+    return f"  align_with({obj_id}, {tgt_id}, axis={axis})"
+
+
+# ── stylize ───────────────────────────────────────────────────────────────────
+
+def _apply_stylize(scene, args, sem_to_name, name_to_sem):
+    obj_id = args.get("obj", "")
+    desc   = args.get("desc", "")
+
+    ok    = _resolve(obj_id, sem_to_name)
+    obj_e = _find_empty(scene, ok) if ok else None
+    if obj_e is None:
+        return f"  stylize({obj_id}) → NOT FOUND"
+
+    obj_e["_style"] = desc
+    return f"  stylize({obj_id}, '{desc}')"
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+#  Main
+# ─────────────────────────────────────────────────────────────────────────────
+
+def main():
+    parser = argparse.ArgumentParser(
+        description="Apply EditLang plans to scene layout (new Blender format)"
+    )
+    parser.add_argument("--scene",  required=True, help="Path to scene layout JSON (new format)")
+    parser.add_argument("--plans",  required=True, help="Path to plan results JSON")
+    parser.add_argument("--outdir", required=True, help="Output directory for per-instruction scenes")
+    cli = parser.parse_args()
+
+    with open(cli.scene) as f:
         original_scene = json.load(f)
-    with open(args.plans) as f:
+    with open(cli.plans) as f:
         results = json.load(f)
 
-    os.makedirs(args.outdir, exist_ok=True)
+    os.makedirs(cli.outdir, exist_ok=True)
 
-    print(f"╔═══════════════════════════════════════════╗")
-    print(f"║  Apply Plans to Scene Layout              ║")
-    print(f"╚═══════════════════════════════════════════╝")
-    print(f"  Scene: {args.scene} ({len(original_scene)} keys)")
-    print(f"  Plans: {args.plans} ({len(results)} instructions)")
-    print(f"  Output: {args.outdir}")
+    n_obj = sum(1 for o in original_scene["objects"] if o["type"] == "EMPTY")
+    print("╔═══════════════════════════════════════════╗")
+    print("║  Apply Plans to Scene Layout (new format) ║")
+    print("╚═══════════════════════════════════════════╝")
+    print(f"  Scene : {cli.scene}  ({n_obj} EMPTY objects)")
+    print(f"  Plans : {cli.plans}  ({len(results)} instructions)")
+    print(f"  Output: {cli.outdir}")
 
     for result in results:
-        idx = result["index"]
-        cmd = result["command"]
-        instr = result["instruction"]
-        plan = result.get("plan", [])
+        idx     = result["index"]
+        cmd     = result["command"]
+        instr   = result["instruction"]
+        plan    = result.get("plan", [])
         success = result.get("success", False)
 
         print(f"\n{'='*60}")
@@ -382,26 +572,26 @@ def main():
         print(f"  Plan: {len(plan)} actions, success={success}")
 
         if not plan:
-            print(f"  → SKIPPED (empty plan)")
+            print("  → SKIPPED (empty plan)")
             continue
 
-        # Deep copy scene
         scene = copy.deepcopy(original_scene)
-        mask_to_sem, sem_to_mask = build_id_maps(scene)
+        name_to_sem, sem_to_name = build_id_maps(scene)
 
-        # Apply each action
         for step_i, action in enumerate(plan):
-            log = apply_action(scene, action, sem_to_mask, mask_to_sem)
-            print(f"  Step {step_i+1}: {log}")
+            log = apply_action(scene, action, sem_to_name, name_to_sem)
+            print(f"  Step {step_i + 1}: {log}")
 
-        # Save
-        outfile = os.path.join(args.outdir, f"scene_layout_instruction_{idx}_{cmd.lower()}.json")
+        outfile = os.path.join(
+            cli.outdir,
+            f"scene_layout_instruction_{idx}_{cmd.lower()}.json",
+        )
         with open(outfile, "w") as f:
             json.dump(scene, f, indent=2, ensure_ascii=False)
         print(f"  → Saved: {outfile}")
 
     print(f"\n{'='*60}")
-    print(f"  Done. Results in: {args.outdir}")
+    print(f"  Done. Results in: {cli.outdir}")
 
 
 if __name__ == "__main__":
