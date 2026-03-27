@@ -264,11 +264,11 @@ No explanations, just the JSON array of ALL goal predicates.
             
             if "objects" in scene_context:
                 for obj in scene_context["objects"]:
-                    obj_id = obj.get("id", obj.get("Variable Name"))
+                    obj_id = obj.get("id", obj.get("Variable Name", obj.get("name")))
                     if obj_id:
                         scene_obj_ids.add(obj_id)
                         cat = obj.get('Category', obj.get('category', 'unknown'))
-                        center = obj.get('center', [])
+                        center = obj.get('center', obj.get('location', []))
                         obj_list.append(f"- {obj_id} (category: {cat}, position: {center})")
             else:
                 # Flat dict format (scene_mask_XXX_category.png)
