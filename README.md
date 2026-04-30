@@ -116,12 +116,9 @@ If you want to export a Blender scene as a `scene_layout.json` file—for exampl
 ## BibTeX
 
 ```bibtex
-@misc{noh2026editasactgoalregressiveplanningopenvocabulary,
-      title={Edit-As-Act: Goal-Regressive Planning for Open-Vocabulary 3D Indoor Scene Editing}, 
-      author={Seongrae Noh and SeungWon Seo and Gyeong-Moon Park and HyeongYeop Kang},
-      year={2026},
-      eprint={2603.17583},
-      archivePrefix={arXiv},
-      primaryClass={cs.CV},
-      url={https://arxiv.org/abs/2603.17583}, 
+@article{noh2026edit,
+  title={Edit-As-Act: Goal-Regressive Planning for Open-Vocabulary 3D Indoor Scene Editing},
+  author={Noh, Seongrae and Seo, SeungWon and Park, Gyeong-Moon and Kang, HyeongYeop},
+  journal={arXiv preprint arXiv:2603.17583},
+  year={2026}
 }
